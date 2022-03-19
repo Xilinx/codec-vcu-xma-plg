@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019, Xilinx Inc - All rights reserved
+ * Copyright (C) 2021, Xilinx Inc - All rights reserved
  * Xilinx Decoder/Encoder XMA Plugin
  *
  * Licensed under the Apache License, Version 2.0 (the "License"). You may
@@ -28,6 +28,8 @@
 #include <xmaplugin.h>
 #include <queue>
 #include <unordered_set>
+
+#include "mpsoc_vcu_hdr.h"
 
 #undef MEASURE_TIME
 #ifdef MEASURE_TIME
@@ -62,16 +64,19 @@
 
 // PIPELINE_DEPTH > 2 is not supported
 #define PIPELINE_DEPTH      2
-#define VCU_STRIDE_ALIGN    256
-#define VCU_HEIGHT_ALIGN    64
 
+#define VCU_STRIDE_ALIGN    32
+/* 'slice-height should be 16-aligned for AVC and 32-aligned for HEVC',
+ * but aligning to 32 works for both */
+#define VCU_HEIGHT_ALIGN    32
 #define ALIGN(x,align) (((x) + (align) - 1) & ~((align) - 1))
 
 /* App using this plugin is suggested to have >= below size.
    MAX_EXTRADATA_SIZE should be consistent with AL_ENC_MAX_CONFIG_HEADER_SIZE on device */
 #define MAX_EXTRADATA_SIZE  (2 * 1024)
 #define MAX_ERR_STRING      1024
-#define XMA_VCU_ENCODER "xma-vcu-encoder"
+#define XMA_VCU_ENCODER     "xma-vcu-encoder"
+#define WARN_BUFF_MAX_SIZE  (4 * 1024)
 static int32_t xma_encoder_close(XmaEncoderSession *enc_session);
 
 enum cmd_type
@@ -116,10 +121,10 @@ typedef struct enc_params
 
 typedef struct enc_dynamic_params
 {
-    uint16_t width;
-    uint16_t height;
-    double framerate;
-    uint16_t rc_mode;
+    uint16_t    width;
+    uint16_t    height;
+    double      framerate;
+    uint16_t    rc_mode;
 } enc_dynamic_params_t;
 
 typedef struct _vcu_enc_usermeta
@@ -134,6 +139,14 @@ typedef struct __obuf_info
     uint32_t recv_size;
     vcu_enc_usermeta obuf_meta;
 } obuf_info;
+
+typedef struct enc_dyn_params
+{
+    bool is_bitrate_changed;
+    uint32_t bit_rate;
+    bool is_bframes_changed;
+    uint8_t num_b_frames;
+}enc_dyn_params_t;
 
 typedef struct host_dev_data
 {
@@ -158,11 +171,20 @@ typedef struct host_dev_data
     uint32_t obuf_indexes_to_release_valid_cnt;
     bool is_idr;
     bool end_encoding;
+    bool is_dyn_params_valid;
+    enc_dyn_params_t dyn_params;
     uint8_t extradata[MAX_EXTRADATA_SIZE];
     uint32_t frame_sad[MAX_LOOKAHEAD_DEPTH];
     uint32_t frame_activity[MAX_LOOKAHEAD_DEPTH];
     uint32_t la_depth;
     char dev_err[MAX_ERR_STRING];
+    uint32_t stride_width;
+    uint32_t stride_height;
+    uint32_t warn_buf_size;
+#ifdef HDR_DATA_SUPPORT
+    vcu_hdr_data hdr_data;
+#endif
+   bool duplicate_frame;
 } sk_payload_data;
 
 typedef struct buff_pool_ctx
@@ -210,6 +232,14 @@ typedef struct xrt_cmd_data
     XmaSideDataHandle rc_sd_handle;
     dev_cu_status cu_status;
     uint64_t timestamp;
+    uint32_t stride_width;
+    uint32_t stride_height;
+    XmaBufferObj warn_buff_obj;
+    uint64_t warn_buff_paddr;
+#ifdef HDR_DATA_SUPPORT
+    bool hdr_data_present;
+#endif
+    bool duplicate_frame;
 } xrt_cmd_data_t;
 
 typedef struct MpsocEncContext
@@ -239,6 +269,7 @@ typedef struct MpsocEncContext
     int32_t enc_recv_out_data_size;
     int64_t enc_recv_out_data_pts;
     int32_t enc_recv_status;
+    int32_t enc_recv_free_obuf_idx;
     bool enc_recv_eos;
     bool read_last_frame;
     bool clear_sb_data;
@@ -248,6 +279,7 @@ typedef struct MpsocEncContext
     enum cmd_type cmd[PIPELINE_DEPTH];
     int64_t frame_pts[PIPELINE_DEPTH];
     uint32_t enable_hw_in_buf;
+    uint32_t hdr_frame_count;
     // sk does not return unused buffers, when flushed
     std::unordered_multiset<XvbmBufferHandle> *pending_release;
 } MpsocEncContext;
@@ -272,7 +304,32 @@ static void zero_out_padded_region(uint8_t *dst,
                                    int16_t start_y,
                                    int16_t dst_stride,
                                    int16_t dst_height);
+#ifdef HDR_DATA_SUPPORT
+static int send_hdr_data_to_sk(XmaEncoderSession *enc_session, XmaFrame *frame)
+{
+    MpsocEncContext  *ctx  = (MpsocEncContext *)enc_session->base.plugin_data;
+    vcu_hdr_data *pHDRdata = &ctx->sk_cmd->obuf_ctx->dev_data->hdr_data;
 
+    XmaSideDataHandle hdr_sd    = NULL;
+    uint8_t          *sd_ptr    = NULL;
+    size_t            sd_size   = 0;
+
+    hdr_sd = xma_frame_get_side_data(frame, XMA_FRAME_HDR);
+    xma_logmsg(XMA_DEBUG_LOG, XMA_VCU_ENCODER,"Sidedata ref count of XMA_FRAME_HDR = %d\n",xma_side_data_get_refcount(hdr_sd));
+    if (hdr_sd) {
+        xma_logmsg(XMA_DEBUG_LOG, XMA_VCU_HDR,"Detected HDR side data in encoder input frame \n");
+        ctx->sk_cmd->hdr_data_present = 1;
+        sd_ptr  = (uint8_t *)xma_side_data_get_buffer(hdr_sd);
+        sd_size = xma_side_data_get_size(hdr_sd);
+        memcpy(pHDRdata, sd_ptr, sd_size*sizeof(char));
+        xma_logmsg(XMA_DEBUG_LOG, XMA_VCU_ENCODER, "HDR data in encoder - %d  \n", ++ctx->hdr_frame_count);
+        print_hdr_data(pHDRdata);
+        xma_frame_remove_side_data_type(frame, XMA_FRAME_HDR);
+    }
+    return XMA_SUCCESS;
+
+}
+#endif
 
 static XmaParameter *getParameter (XmaParameter *params, int num_params,
                                    const char  *name)
@@ -626,11 +683,24 @@ static int prepare_sk_cmd(xrt_cmd_data_t *cmd, enum cmd_type type, int64_t pts,
         case VCU_PUSH:
             uint32_t i;
             data.is_idr = cmd->is_idr[pipeline_idx];
+            data.is_dyn_params_valid = cmd->obuf_ctx->dev_data->is_dyn_params_valid;
+            if(data.is_dyn_params_valid) {
+                memcpy(&data.dyn_params, &cmd->obuf_ctx->dev_data->dyn_params, sizeof(enc_dyn_params_t));
+                cmd->obuf_ctx->dev_data->is_dyn_params_valid = 0;
+            }
+
             /* initial input buff index to send*/
             data.ibuf_size  = xvbm_buffer_get_size(cmd->b_handle[pipeline_idx]);
             data.ibuf_index = xvbm_buffer_get_id(cmd->b_handle[pipeline_idx]);
             data.ibuf_paddr = xvbm_buffer_get_paddr(cmd->b_handle[pipeline_idx]);
             data.ibuf_meta.pts = pts;
+            data.duplicate_frame = cmd->duplicate_frame;
+#ifdef HDR_DATA_SUPPORT
+            if(cmd->hdr_data_present) {
+                memcpy(&data.hdr_data, &cmd->obuf_ctx->dev_data->hdr_data, sizeof(vcu_hdr_data));
+                cmd->hdr_data_present = 0;
+            }
+#endif
 
             i = 0;
             while(cmd->obuf_ctx->obuf_free_list->size()) {
@@ -679,6 +749,8 @@ static int prepare_sk_cmd(xrt_cmd_data_t *cmd, enum cmd_type type, int64_t pts,
                        MAX_LOOKAHEAD_DEPTH * sizeof data.frame_activity[0]);
                 data.la_depth = 0;
             }
+            data.stride_width  = cmd->stride_width;
+            data.stride_height = cmd->stride_height;
             break;
         case VCU_PREINIT:
             /* TODO: get file permission flags for 755 */
@@ -709,7 +781,6 @@ static int prepare_sk_cmd(xrt_cmd_data_t *cmd, enum cmd_type type, int64_t pts,
             cmd->dynamic_params_buff->width = cmd->enc_props->width;
             cmd->dynamic_params_buff->height = cmd->enc_props->height;
             cmd->dynamic_params_buff->rc_mode = set_rc_mode(cmd->enc_props->rc_mode);
-
             /* non zero denominator is prechecked, before we use it below */
             cmd->dynamic_params_buff->framerate = (cmd->enc_props->framerate.numerator *
                                                    1.0) /
@@ -750,6 +821,17 @@ static int prepare_sk_cmd(xrt_cmd_data_t *cmd, enum cmd_type type, int64_t pts,
             cmd->registers[++idx] = cmd->lambda_buff_paddr & 0xFFFFFFFF;
             cmd->registers[++idx] = ((uint64_t)(cmd->lambda_buff_paddr) >> 32) & 0xFFFFFFFF;
             cmd->registers[++idx] = cmd->lambda_size;
+
+            cmd->warn_buff_obj = xma_plg_buffer_alloc(*(cmd->xma_session),
+                                         WARN_BUFF_MAX_SIZE, false, &ret);
+            if (ret != XMA_SUCCESS)
+                goto err3;
+
+            cmd->warn_buff_paddr = cmd->warn_buff_obj.paddr;
+
+            cmd->registers[++idx] = cmd->warn_buff_paddr & 0xFFFFFFFF;
+            cmd->registers[++idx] = ((uint64_t)(cmd->warn_buff_paddr) >> 32) & 0xFFFFFFFF;
+            cmd->registers[++idx] = WARN_BUFF_MAX_SIZE;
 
             ret = XMA_SUCCESS;
             goto done;
@@ -905,6 +987,16 @@ static int32_t xma_encoder_init(XmaEncoderSession *enc_session)
         return XMA_ERROR;
     }
 
+    if (payload_data.warn_buf_size && payload_data.warn_buf_size < WARN_BUFF_MAX_SIZE) {
+       memset(sk_cmd->warn_buff_obj.data, 0, WARN_BUFF_MAX_SIZE);
+       ret = xma_plg_buffer_read(xma_session, sk_cmd->warn_buff_obj,
+		                 payload_data.warn_buf_size, 0);
+
+       if (ret != XMA_SUCCESS) {
+           goto err4;
+       }
+       xma_logmsg(XMA_WARNING_LOG, XMA_VCU_ENCODER, "device warning: %s", sk_cmd->warn_buff_obj.data);
+    }
 
     sk_cmd->ibuf_ctx = (buff_pool_ctx_t *)malloc (sizeof (buff_pool_ctx_t));
     if (!(sk_cmd->ibuf_ctx)) {
@@ -1041,14 +1133,17 @@ static int32_t xma_encoder_init(XmaEncoderSession *enc_session)
     ctx->cmd_scheduled   = false;
     ctx->pipeline_widx   = 0;
     ctx->pipeline_ridx   = 0;
+    ctx->hdr_frame_count = 0;
 
     for (int i = 0; i < PIPELINE_DEPTH; ++i) {
         ctx->cmd[i]       = VCU_PREINIT;
         ctx->frame_pts[i] = 0;
     }
+    ctx->enc_recv_out_databuf = nullptr;
     ctx->enc_recv_out_data_size = 0;
     ctx->enc_recv_out_data_pts = 0;
     ctx->enc_recv_status = XMA_TRY_AGAIN;
+    ctx->enc_recv_free_obuf_idx = -1;
 
 #ifdef MEASURE_TIME
     ctx->send_count = 0;
@@ -1245,80 +1340,76 @@ static void zero_out_padded_region(uint8_t *dst,
     }
 }
 
-
 static int get_raw_host_frame(MpsocEncContext *ctx, XmaFrame *frame,
                               uint32_t widx)
 {
-    uint8_t *src, *dst;
-    size_t size_y, size_uv;
-    int16_t dst_stride, dst_height;
-    int16_t src_stride;
-    int ret = 0;
-    int i;
-    XvbmBufferHandle b_handle;
-
-    b_handle   = xvbm_buffer_pool_entry_alloc(ctx->pool);
+    XvbmBufferHandle b_handle = xvbm_buffer_pool_entry_alloc(ctx->pool);
     if(!b_handle) {
         xma_logmsg(XMA_ERROR_LOG, XMA_VCU_ENCODER,
                    "Error: (%s) Buffer Pool full - no free buffer available\n", __func__);
         return XMA_ERROR;
     }
-    dst_stride = ALIGN(frame->frame_props.width,  VCU_STRIDE_ALIGN);
-    dst_height = ALIGN(frame->frame_props.height, VCU_HEIGHT_ALIGN);
-
-    size_y   = ((size_t)dst_stride * dst_height);
-    size_uv  = size_y >> 1;
-
-    if ((frame->frame_props.linesize[0] != (int32_t)dst_stride) ||
-            (frame->frame_props.height      != dst_height)) {
-        src_stride = frame->frame_props.linesize[0];
-
-        //PLANE_Y
-        src = (uint8_t *)frame->data[0].buffer;
-        dst = (uint8_t *)xvbm_buffer_get_host_ptr(b_handle);
-
-        //zero out the padded area
-        zero_out_padded_region(dst, frame->frame_props.width, 0,  dst_stride,
-                               dst_height);
-        zero_out_padded_region(dst, 0, frame->frame_props.height, dst_stride,
-                               dst_height);
-
-        //copy pixel data
-        for(i = 0; i < frame->frame_props.height; ++i) {
-            memcpy(dst, src, frame->frame_props.width);
-            src += src_stride;
-            dst += dst_stride;
-        }
-
-        //PLANE_UV
-        src = (uint8_t *)frame->data[1].buffer;
-        dst = (uint8_t *)xvbm_buffer_get_host_ptr(b_handle);
-        dst += size_y;
-        src_stride = frame->frame_props.linesize[1];
-
-        //zero out the padded area
-        zero_out_padded_region(dst, frame->frame_props.width, 0,    dst_stride,
-                               dst_height/2);
-        zero_out_padded_region(dst, 0, frame->frame_props.height/2, dst_stride,
-                               dst_height/2);
-
-        for(i = 0; i < frame->frame_props.height/2; ++i) {
-            memcpy(dst, src, frame->frame_props.width);
-            src += src_stride;
-            dst += dst_stride;
-        }
+    uint8_t *src_buffer;
+    uint8_t *device_buffer      = (uint8_t *)xvbm_buffer_get_host_ptr(b_handle);
+    uint16_t src_bytes_in_line  = frame->frame_props.linesize[0];
+    uint16_t dev_bytes_in_line = 0;
+    if (frame->frame_props.bits_per_pixel == 10) {
+        dev_bytes_in_line  = ALIGN(((frame->frame_props.width+2)/3)*4,
+                                   VCU_STRIDE_ALIGN);
     } else {
-        dst = (uint8_t *)xvbm_buffer_get_host_ptr(b_handle);
-        memcpy(dst, frame->data[0].buffer, size_y);
-        dst += size_y;
-        memcpy(dst, frame->data[1].buffer, size_uv);
+        dev_bytes_in_line  = ALIGN(frame->frame_props.width, VCU_STRIDE_ALIGN);
     }
-    ret = xvbm_buffer_write(b_handle,
-                            xvbm_buffer_get_host_ptr(b_handle),
-                            (size_y+size_uv), 0);
-
+    uint16_t src_height         = frame->frame_props.height;
+    uint16_t dev_height         = ALIGN(src_height, VCU_HEIGHT_ALIGN);
+    size_t dev_y_size           = dev_bytes_in_line * dev_height;
+    int ret                     = 0;
+    if (src_bytes_in_line != dev_bytes_in_line) {
+        uint16_t dev_rows_in_plane = dev_height;
+        uint16_t src_rows_in_plane = src_height;
+        int16_t stride_delta = dev_bytes_in_line - src_bytes_in_line;
+        int16_t height_delta = dev_rows_in_plane - src_rows_in_plane;
+        size_t dev_index = 0;
+        for (int plane_id = 0; plane_id < xma_frame_planes_get(&frame->frame_props);
+                plane_id++) {
+            size_t src_index = 0;
+            src_buffer = (uint8_t *)frame->data[plane_id].buffer;
+            if(plane_id > 0) {
+                dev_rows_in_plane = dev_height / 2;
+                src_rows_in_plane = src_height / 2;
+                height_delta = dev_rows_in_plane - src_rows_in_plane;
+            }
+            for(uint16_t h = 0; h < src_rows_in_plane && h < dev_rows_in_plane; h++) {
+                for(uint16_t w = 0; w < src_bytes_in_line && w < dev_bytes_in_line; w++) {
+                    device_buffer[dev_index] = src_buffer[src_index];
+                    src_index++;
+                    dev_index++;
+                }
+                if(stride_delta > 0) {
+                    dev_index += stride_delta;
+                } else {
+                    src_index += -1 * stride_delta; // src > dev (higher alignment)
+                }
+            }
+            if(height_delta > 0) {
+                dev_index += dev_bytes_in_line * height_delta;
+            } // No else necessary because src_index resets.
+        }
+        ret = xvbm_buffer_write(b_handle, device_buffer,
+                                (3 * dev_y_size) >> 1, 0);
+    } else {
+        size_t src_y_size = src_bytes_in_line * src_height;
+        ret = xvbm_buffer_write(b_handle, frame->data[0].buffer, src_y_size, 0);
+        if (!ret) {
+            ret = xvbm_buffer_write(b_handle, frame->data[1].buffer, src_y_size >> 1,
+                                    dev_y_size);
+        }
+    }
     ctx->sk_cmd->b_handle[widx] = b_handle;
-    return (ret);
+    if (ret) {
+        xma_logmsg(XMA_ERROR_LOG, XMA_VCU_ENCODER,
+                   "Error: (%s) DMA to device failed", __func__);
+    }
+    return ret;
 }
 
 static int get_qp_map_data(MpsocEncContext *ctx, XmaFrame *frame)
@@ -1412,6 +1503,21 @@ static int send_qp_map_data_to_dev(MpsocEncContext *ctx)
     return XMA_SUCCESS;
 }
 
+static void get_dyn_params_data(MpsocEncContext *ctx, XmaFrame *frame)
+{
+    XmaSideDataHandle sd = xma_frame_get_side_data(frame, XMA_FRAME_DYNAMIC_PARAMS);
+    if (sd) {
+        enc_dyn_params_t *dyn_param_ptr    = NULL;
+        dyn_param_ptr  = (enc_dyn_params_t *)xma_side_data_get_buffer(sd);
+        xma_logmsg(XMA_DEBUG_LOG, XMA_VCU_ENCODER, "Got enc dyn params in xma plugin %d, %d \n",
+                   dyn_param_ptr->bit_rate, dyn_param_ptr->num_b_frames);
+        ctx->sk_cmd->obuf_ctx->dev_data->is_dyn_params_valid = 1;
+        memcpy(&ctx->sk_cmd->obuf_ctx->dev_data->dyn_params, dyn_param_ptr, sizeof(enc_dyn_params_t));
+        xma_frame_remove_side_data_type(frame, XMA_FRAME_DYNAMIC_PARAMS);
+    }
+    return;
+}
+
 static int get_sideband_data(MpsocEncContext *ctx, XmaFrame *frame)
 {
     int ret = XMA_ERROR;
@@ -1427,6 +1533,11 @@ static int get_sideband_data(MpsocEncContext *ctx, XmaFrame *frame)
     if(XMA_SUCCESS != send_qp_map_data_to_dev(ctx)) {
         return ret;
     }
+
+    //This routine does not free HDR10 metadata as it is freed by another routine.
+    //Make sure HDR data is used before this routine, as this will free all side data.
+
+    get_dyn_params_data(ctx, frame);
 
     if (ctx->clear_sb_data) {
         xma_frame_clear_all_side_data(frame);
@@ -1485,14 +1596,17 @@ static int process_cmd_response(MpsocEncContext *ctx, XmaSession  xma_session)
             xvbm_buffer_pool_entry_free(free_b_handle);
             XVBM_BUFF_PR("\t\t\tENC: Input buffer consumed. Freeing Input Buffer =%p freed_ibuf_index = %d\n",
                          free_b_handle, payload_data.freed_ibuf_index);
-            if (ctx->pending_release->erase(free_b_handle) == 0) {
+            auto buf_elem = ctx->pending_release->find(free_b_handle);
+            if (buf_elem != ctx->pending_release->end()) {
+                ctx->pending_release->erase(buf_elem);
+            } else {
                 xma_logmsg(XMA_WARNING_LOG, XMA_VCU_ENCODER,
                            "%s: b_handle %p already released, something went wrong here\n",
                            __func__, free_b_handle);
             }
         } else {
             xma_logmsg(XMA_ERROR_LOG, XMA_VCU_ENCODER,
-                       "%s: b_handle is empty, something wrong here\n", __func__);
+                       "%s: b_handle is empty, something went wrong here\n", __func__);
             return XMA_ERROR;
         }
     }
@@ -1565,10 +1679,7 @@ static int32_t xma_encoder_send_frame(XmaEncoderSession *enc_session,
             }
         }
         if (frame->data[0].buffer_type == XMA_HOST_BUFFER_TYPE) {
-            int32_t ret;
-
-            ret = get_raw_host_frame(ctx, frame, ctx->pipeline_widx);
-            if (ret) {
+            if (get_raw_host_frame(ctx, frame, ctx->pipeline_widx)) {
                 xma_logmsg(XMA_ERROR_LOG, XMA_VCU_ENCODER,
                            "%s: ERROR: host buffer write failed\n", __func__);
                 return XMA_ERROR;
@@ -1590,6 +1701,11 @@ static int32_t xma_encoder_send_frame(XmaEncoderSession *enc_session,
 #endif //DUMP_INPUT_YUV
 
         }
+        auto buf_elem = ctx->pending_release->find(ctx->sk_cmd->b_handle[ctx->pipeline_widx]);
+        if (buf_elem == ctx->pending_release->end())
+            ctx->sk_cmd->duplicate_frame = false;
+        else
+            ctx->sk_cmd->duplicate_frame = true;
         ctx->pending_release->insert(ctx->sk_cmd->b_handle[ctx->pipeline_widx]);
 
         if (!ctx->pool_extended) {
@@ -1614,10 +1730,15 @@ static int32_t xma_encoder_send_frame(XmaEncoderSession *enc_session,
                 xma_logmsg(XMA_DEBUG_LOG, XMA_VCU_ENCODER,
                            "%s : extended earlier output pool to %d buffers\n", __func__, cnt);
             } else {
+                ctx->pending_release->erase(ctx->sk_cmd->b_handle[ctx->pipeline_widx]);
                 xma_logmsg(XMA_ERROR_LOG, XMA_VCU_ENCODER,
                            "%s : failed to extend memory pool. out of memory ?\n", __func__);
                 return XMA_ERROR;
             }
+
+            /* update extended buffers with incoming stride */
+            ctx->sk_cmd->stride_width = frame->frame_props.linesize[0];
+            ctx->sk_cmd->stride_height = frame->frame_props.linesize[1];
             ctx->sk_cmd->pool_handle = xvbm_get_pool_handle(
                                            ctx->sk_cmd->b_handle[ctx->pipeline_widx]);
 
@@ -1647,6 +1768,9 @@ static int32_t xma_encoder_send_frame(XmaEncoderSession *enc_session,
 
     //Schedule Processing for First Frame
     if(ctx->first_frame < (PIPELINE_DEPTH-1)) {
+#ifdef HDR_DATA_SUPPORT
+        send_hdr_data_to_sk(enc_session, frame);
+#endif
         //extract side-band data from frame
         ret = get_sideband_data(ctx, frame);
         if(ret != XMA_SUCCESS) {
@@ -1674,7 +1798,7 @@ static int32_t xma_encoder_send_frame(XmaEncoderSession *enc_session,
     * ----------------------------*/
     if (ctx->cmd_scheduled == true) {
         ctx->cmd_scheduled = false;
-        ret = xma_plg_is_work_item_done(xma_session, 500);
+        ret = xma_plg_is_work_item_done(xma_session, 5000);
         if(ret != XMA_SUCCESS) {
             xma_logmsg(XMA_ERROR_LOG, XMA_VCU_ENCODER,
                        "ERROR:: (%s) frame_done signal not received from hw\n", __func__);
@@ -1701,7 +1825,12 @@ static int32_t xma_encoder_send_frame(XmaEncoderSession *enc_session,
     /*-----------------------------
     * Read/Recv Frame (from VCU)
     * ----------------------------*/
-    ctx->enc_recv_out_databuf = NULL;
+    if (ctx->enc_recv_out_databuf) {
+        xma_logmsg(XMA_ERROR_LOG, XMA_VCU_ENCODER,
+                   "encoder send(): Last encoded frame not recieved by User!\n");
+        return XMA_ERROR;
+    }
+
     ctx->enc_recv_status = run_recv_cmd(ctx, xma_session);
 
     if (ctx->enc_recv_out_data_size < 0) {
@@ -1725,7 +1854,7 @@ static int32_t xma_encoder_send_frame(XmaEncoderSession *enc_session,
                        __func__);
             return XMA_ERROR;
         }
-        ret = xma_plg_is_work_item_done(xma_session, 500);
+        ret = xma_plg_is_work_item_done(xma_session, 5000);
         if(ret != XMA_SUCCESS) {
             xma_logmsg(XMA_ERROR_LOG, XMA_VCU_ENCODER,
                        "ERROR:: (%s) frame_done signal not received from hw\n", __func__);
@@ -1738,7 +1867,7 @@ static int32_t xma_encoder_send_frame(XmaEncoderSession *enc_session,
             return XMA_ERROR;
         }
         ctx->enc_recv_eos = true;
-        if (ctx->enc_recv_out_databuf == NULL) {
+        if (ctx->enc_recv_out_databuf == nullptr) {
             return XMA_FLUSH_AGAIN;
         } else {
             return XMA_SUCCESS;
@@ -1753,6 +1882,9 @@ static int32_t xma_encoder_send_frame(XmaEncoderSession *enc_session,
     * ----------------------------*/
     if ((frame->data[0].buffer != NULL) &&
             ctx->cmd[ctx->pipeline_ridx] == VCU_PUSH) {
+#ifdef HDR_DATA_SUPPORT
+        send_hdr_data_to_sk(enc_session, frame);
+#endif
         //extract side-band data from frame
         ret = get_sideband_data(ctx, frame);
         if(ret != XMA_SUCCESS) {
@@ -1801,7 +1933,7 @@ static int32_t run_recv_cmd(MpsocEncContext *ctx, XmaSession  xma_session)
     }
 
     if (ctx->sk_cmd->obuf_ctx->dev_data->freed_index_cnt &&
-        ctx->sk_cmd->obuf_ctx->current_free_obuf_index < MAX_OUT_BUFF_COUNT) {
+            ctx->sk_cmd->obuf_ctx->current_free_obuf_index < MAX_OUT_BUFF_COUNT) {
         uint32_t idx =
             ctx->sk_cmd->obuf_ctx->dev_data->obuf_info_data[ctx->sk_cmd->obuf_ctx->current_free_obuf_index].obuff_index;
         if (idx != 0xBAD) {
@@ -1819,22 +1951,26 @@ static int32_t run_recv_cmd(MpsocEncContext *ctx, XmaSession  xma_session)
             if (size) {
                 ret = xma_plg_buffer_read(xma_session, buf_objs[idx], size, 0);
                 if (ret != 0) {
+                    /* Ideally the freed out buffer idx should be moved to free list even in failure cases.
+                       Not moving it to the free list, to keep the legacy behaviour. */
                     xma_logmsg(XMA_ERROR_LOG, XMA_VCU_ENCODER, "xclSyncBO failed %d in %s \n", ret,
                                __func__);
                     return ret;
                 }
                 ctx->enc_recv_out_data_size = size;
             } else {
+                /* Ideally the freed out buffer idx should be moved to free list even in this case.
+                   Not moving it to the free list, to keep the legacy behaviour. */
+                ctx->enc_recv_free_obuf_idx = -1;
                 ctx->enc_recv_out_data_size = -1;
-                ctx->enc_recv_out_databuf = NULL;
+                ctx->enc_recv_out_databuf = nullptr;
                 return XMA_EOS;
             }
 
             ctx->enc_recv_out_databuf = ctx->sk_cmd->obuf_ctx->buf_objs[idx].data;
             ctx->enc_recv_out_data_pts =
                 ctx->sk_cmd->obuf_ctx->dev_data->obuf_info_data[ctx->sk_cmd->obuf_ctx->current_free_obuf_index].obuf_meta.pts;
-
-            ctx->sk_cmd->obuf_ctx->obuf_free_list->push(idx);
+            ctx->enc_recv_free_obuf_idx = idx;
             ctx->sk_cmd->obuf_ctx->dev_data->freed_index_cnt--;
             ctx->sk_cmd->obuf_ctx->current_free_obuf_index++;
 #ifdef MEASURE_TIME
@@ -1917,22 +2053,26 @@ static int32_t run_recv_cmd(MpsocEncContext *ctx, XmaSession  xma_session)
             if (size) {
                 ret = xma_plg_buffer_read(xma_session, buf_objs[idx], size, 0);
                 if (ret != 0) {
+                    /* Ideally the freed out buffer idx should be moved to free list even in error case.
+                       Not moving it to the free list, to keep the legacy behaviour. */
                     xma_logmsg(XMA_ERROR_LOG, XMA_VCU_ENCODER, "xclSyncBO failed %d in %s \n", ret,
                                __func__);
                     return ret;
                 }
                 ctx->enc_recv_out_data_size = size;
             } else {
+                /* Ideally the freed out buffer idx should be moved to free list even in this case.
+                   Not moving it to the free list, to keep the legacy behaviour. */
+                ctx->enc_recv_free_obuf_idx = -1;
                 ctx->enc_recv_out_data_size = -1;
-                ctx->enc_recv_out_databuf = NULL;
+                ctx->enc_recv_out_databuf = nullptr;
                 return XMA_EOS;
             }
 
             ctx->enc_recv_out_databuf = ctx->sk_cmd->obuf_ctx->buf_objs[idx].data;
             ctx->enc_recv_out_data_pts =
                 ctx->sk_cmd->obuf_ctx->dev_data->obuf_info_data[ctx->sk_cmd->obuf_ctx->current_free_obuf_index].obuf_meta.pts;
-
-            ctx->sk_cmd->obuf_ctx->obuf_free_list->push(idx);
+            ctx->enc_recv_free_obuf_idx = idx;
             ctx->sk_cmd->obuf_ctx->dev_data->freed_index_cnt--;
             ctx->sk_cmd->obuf_ctx->current_free_obuf_index++;
 
@@ -1987,12 +2127,15 @@ static int32_t xma_encoder_recv(XmaEncoderSession *enc_session,
                                 XmaDataBuffer     *recv_data,
                                 int32_t           *data_size)
 {
-
+    if(recv_data->data.buffer == NULL) {
+        xma_logmsg(XMA_ERROR_LOG, XMA_VCU_ENCODER, "encoder: output buffer = NULL");
+        return XMA_ERROR;
+    }
     MpsocEncContext  *ctx  = (MpsocEncContext *) enc_session->base.plugin_data;
 
     //for last frame (after flush operation), only xma_encoder_recv is called (without xma_encoder_send_frame)
     //"read_last_frame" flag triggers hw read for last frame
-    if(ctx->read_last_frame && (ctx->enc_recv_out_databuf == NULL)) {
+    if(ctx->read_last_frame && (ctx->enc_recv_out_databuf == nullptr)) {
         XmaSession  xma_session  = enc_session->base;
 
         ctx->sk_cmd->xma_session = &xma_session;
@@ -2009,12 +2152,24 @@ static int32_t xma_encoder_recv(XmaEncoderSession *enc_session,
     }
 
     if (ctx->enc_recv_out_databuf) {
-        recv_data->data.buffer = ctx->enc_recv_out_databuf;
+        if (recv_data->alloc_size < ctx->enc_recv_out_data_size) {
+            xma_logmsg(XMA_ERROR_LOG, XMA_VCU_ENCODER,
+                       "encoder: output buffer size(%d) < encoded frame size(%d)",
+                       recv_data->alloc_size, ctx->enc_recv_out_data_size);
+            return XMA_ERROR;
+        }
+        //recv_data->data.buffer = ctx->enc_recv_out_databuf;
+        memcpy(recv_data->data.buffer, ctx->enc_recv_out_databuf,
+               ctx->enc_recv_out_data_size);
         *data_size             = ctx->enc_recv_out_data_size;
         recv_data->pts         = ctx->enc_recv_out_data_pts;
-        ctx->enc_recv_out_databuf = NULL;
+        ctx->enc_recv_out_databuf = nullptr;
         ctx->enc_recv_out_data_size = 0;
         ctx->enc_recv_out_data_pts = 0;
+        if (ctx->enc_recv_free_obuf_idx >= 0) {
+            ctx->sk_cmd->obuf_ctx->obuf_free_list->push(ctx->enc_recv_free_obuf_idx);
+            ctx->enc_recv_free_obuf_idx = -1;
+        }
     }
     if(ctx->enc_recv_eos) {
         ctx->read_last_frame = true;
@@ -2067,6 +2222,10 @@ static int32_t xma_encoder_close(XmaEncoderSession *enc_session)
     }
 
 cleanup:
+    if (ctx->sk_cmd->warn_buff_obj.data) {
+        xma_plg_buffer_free (xma_session, ctx->sk_cmd->warn_buff_obj);
+    }
+
     /* free input buffers */
     if (ctx->sk_cmd->ibuf_ctx) {
         free (ctx->sk_cmd->ibuf_ctx);
@@ -2151,3 +2310,4 @@ XmaEncoderPlugin encoder_plugin = {
     .close = xma_encoder_close,
     .xma_version    = xma_encoder_version
 };
+

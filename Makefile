@@ -21,17 +21,17 @@ RPMDIR := RPM_Release
 
 dev: | $(DEVDIR)
 	cd $(DEVDIR); \
-	cmake -DCMAKE_BUILD_TYPE=Debug -DCMAKE_INSTALL_PREFIX=$(CURDIR)/Debug ..; \
+	cmake -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS_DEBUG="-O0 -g" -DCMAKE_INSTALL_PREFIX=$(CURDIR)/Debug ..; \
 	make install
 
 DEB: | $(DEBDIR)
 	cd $(DEBDIR); \
-	cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/xilinx ..; \
+	cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_DEBUG="-O3" -DCMAKE_INSTALL_PREFIX=/opt/xilinx ..; \
 	cpack -G DEB
 
 RPM: | $(RPMDIR)
 	cd $(RPMDIR); \
-	cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/xilinx ..; \
+	cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_DEBUG="-O3" -DCMAKE_INSTALL_PREFIX=/opt/xilinx ..; \
 	cpack -G RPM
 
 $(DEVDIR):

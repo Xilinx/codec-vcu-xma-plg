@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019, Xilinx Inc - All rights reserved
+ * Copyright (C) 2021, Xilinx Inc - All rights reserved
  * Xilinx Decoder/Encoder XMA Plugin
  *
  * Licensed under the Apache License, Version 2.0 (the "License"). You may
@@ -27,6 +27,8 @@
 
 #include <xmaplugin.h>
 
+#include "mpsoc_vcu_hdr.h"
+
 #undef MEASURE_TIME
 #ifdef MEASURE_TIME
 #define MAX_COUNT_TIME 1000
@@ -42,6 +44,8 @@
 */
 #define FRM_BUF_POOL_SIZE       50
 #define DEC_REGMAP_SIZE         20
+#define MAX_HDR_BUFFS FRM_BUF_POOL_SIZE
+
 
 #include <xvbm.h>
 #include <list>
@@ -71,9 +75,14 @@
 #define MULTI_DEC_MAX_HEIGHT  2160
 
 #define AVC_PROFILE_IDC_BASELINE 66
+#define AVC_PROFILE_IDC_CONSTRAINED_BASELINE (AVC_PROFILE_IDC_BASELINE | (1<<9))
 #define AVC_PROFILE_IDC_MAIN     77
 #define AVC_PROFILE_IDC_HIGH     100
+#define AVC_PROFILE_IDC_HIGH10   110
+#define AVC_PROFILE_IDC_HIGH10_INTRA (AVC_PROFILE_IDC_HIGH10| (1<<11))
 #define HEVC_PROFILE_IDC_MAIN    1
+#define HEVC_PROFILE_IDC_MAIN10  2
+#define HEVC_PROFILE_IDC_RExt    4
 static int32_t xma_decoder_close(XmaDecoderSession *dec_session);
 
 enum cmd_type
@@ -109,10 +118,17 @@ typedef struct dec_params
     uint32_t splitbuff_mode;
 } dec_params_t;
 
-typedef struct _vcu_dec_usermeta
+typedef struct _vcu_dec_in_usermeta
 {
     int64_t pts;
-} vcu_dec_usermeta;
+} vcu_dec_in_usermeta;
+
+typedef struct _vcu_dec_out_usermeta {
+  int64_t pts;
+#ifdef HDR_DATA_SUPPORT
+  bool is_hdr_present;
+#endif
+} vcu_dec_out_usermeta;
 
 typedef struct _out_buf_info
 {
@@ -120,8 +136,6 @@ typedef struct _out_buf_info
     size_t freed_obuf_size;
     uint32_t freed_obuf_index;
 } out_buf_info;
-
-#define MAX_OUT_INFOS 25
 
 typedef struct host_dev_data
 {
@@ -135,12 +149,15 @@ typedef struct host_dev_data
     uint32_t dev_to_host_ibuf_idx;
     bool last_ibuf_copied;
     bool resolution_found;
-    vcu_dec_usermeta ibuff_meta;
-    vcu_dec_usermeta obuff_meta[FRM_BUF_POOL_SIZE];
+    vcu_dec_in_usermeta ibuff_meta;
+    vcu_dec_out_usermeta obuff_meta[FRM_BUF_POOL_SIZE];
     bool end_decoding;
     uint32_t free_index_cnt;
     int valid_oidxs;
-    out_buf_info obuf_info[MAX_OUT_INFOS];
+    out_buf_info obuf_info[FRM_BUF_POOL_SIZE];
+#ifdef HDR_DATA_SUPPORT
+    out_buf_info hdrbuf_info[FRM_BUF_POOL_SIZE];
+#endif
     char dev_err[MAX_ERR_STRING];
 } sk_payload_data;
 
@@ -150,7 +167,6 @@ typedef struct buff_pool_ctx
 {
     XmaBufferObj buff_obj;
     XmaBufferObj buff_obj_arr[MAX_IBUFFS];
-//  uint64_t    buff_paddr;
     uint32_t    buf_size;
 } buff_pool_ctx_t;
 
@@ -158,14 +174,22 @@ typedef struct obuff_pool_ctx
 {
     XmaBufferObj parent_buff_obj;
     uint64_t    parent_buff_paddr;
-    XmaBufferObj *buf_objs;
+#ifdef HDR_DATA_SUPPORT
+    XmaBufferObj hdr_parent_buff_obj;
+    uint64_t    hdr_parent_buff_paddr;
+#endif
     uint32_t    buf_size;
     uint32_t    buf_count;
     XvbmPoolHandle out_pool_handle;
+#ifdef HDR_DATA_SUPPORT
+    XvbmPoolHandle hdr_pool_handle;
+#endif
     // sk does not return unused buffers, when flushed
     std::unordered_multiset<XvbmBufferHandle> *pending_release;
     sk_payload_data *dev_data;
     uint32_t current_free_obuf_index;
+    int32_t stride;
+    int32_t aligned_height;
 } obuff_pool_ctx_t;
 
 typedef struct xrt_cmd_data
@@ -182,6 +206,9 @@ typedef struct xrt_cmd_data
     uint32_t ibuff_valid_size;
     XmaDecoderSession *dec_session;
     XvbmBufferHandle o_xvbm_buffer_handle;
+#ifdef HDR_DATA_SUPPORT
+    XvbmBufferHandle hdr_xvbm_buffer_handle;
+#endif
     uint32_t use_zero_copy;
     uint32_t host_to_dev_ibuf_idx;
     dev_cu_status cu_status;
@@ -210,7 +237,58 @@ typedef struct MpsocDecContext
     long long int time_taken;
     int latency_logging;
     uint8_t *last_buf_ptr;
+    uint32_t hdr_frame_count;
+    bool disable_hdr10;
+    int32_t last_push_status;
 } MpsocDecContext;
+
+#ifdef HDR_DATA_SUPPORT
+static vcu_hdr_data* decoder_get_hdr_data(XvbmPoolHandle hdr_pool_handle, uint32_t idx)
+{
+    int32_t ret;
+    XvbmBufferHandle hdr_handle;
+    vcu_hdr_data *hdr_buf;
+
+    hdr_handle = xvbm_get_buffer_handle(hdr_pool_handle, idx);
+    if (!hdr_handle) {
+        xma_logmsg(XMA_ERROR_LOG, XMA_VCU_DECODER, "[%s][%d]xma_dec : invalid idx\n", __func__, __LINE__);
+        return NULL;
+    }
+    hdr_buf = (vcu_hdr_data *)xvbm_buffer_get_host_ptr(hdr_handle);
+    if (!hdr_buf) {
+        xma_logmsg(XMA_ERROR_LOG, XMA_VCU_DECODER, "[%s][%d]xma_dec : invalid host hdr buffer\n", __func__, __LINE__);
+        return NULL;
+    }
+    ret = xvbm_buffer_read(hdr_handle, (uint8_t *)hdr_buf, sizeof(vcu_hdr_data), 0);
+    if (ret) {
+        xma_logmsg(XMA_ERROR_LOG, XMA_VCU_DECODER, "[%s][%d]xma_dec : failed to do read...\n", __func__, __LINE__);
+        return NULL;
+    }
+    return hdr_buf;
+}
+
+static int32_t decoder_add_hdr_side_data(XmaFrame *frame, vcu_hdr_data *hdr_metadata)
+{
+    XmaSideDataHandle sd = 0;
+
+    xma_logmsg(XMA_DEBUG_LOG, XMA_VCU_DECODER,
+               "Allocating side data in decoder input frame \n");
+    sd = xma_side_data_alloc(hdr_metadata, XMA_FRAME_HDR,
+                            sizeof(vcu_hdr_data), 0);
+    if(sd == nullptr) {
+        xma_logmsg(XMA_ERROR_LOG, XMA_VCU_DECODER,
+                   "Failed allocating side data in decoder input frame \n");
+        return XMA_ERROR;
+    }
+
+    if(xma_frame_add_side_data(frame, sd) == XMA_SUCCESS) {
+        xma_side_data_dec_ref(sd);
+        return XMA_SUCCESS;
+    }
+
+    return XMA_ERROR;
+}
+#endif
 
 static XmaParameter *getParameter (XmaParameter *params, int num_params,
                                    const char  *name)
@@ -259,28 +337,65 @@ static void free_xrt_res(xrt_cmd_data *cmd)
     }
 }
 
-static void
+static int32_t
 fill_free_outbuffer_indexes (xrt_cmd_data_t *cmd,  sk_payload_data *data)
 {
     int free_pool_size;
     int i;
     uint64_t paddr;
+#ifdef HDR_DATA_SUPPORT
+    uint64_t hdr_paddr;
+#endif
 
     if (!cmd->obuf_ctx || !(cmd->obuf_ctx->out_pool_handle)) {
-        return;
+        return XMA_ERROR;
     }
+
+#ifdef HDR_DATA_SUPPORT
+    XvbmBufferHandle obuf_handle = xvbm_get_buffer_handle(cmd->obuf_ctx->out_pool_handle, 0);
+    XvbmBufferHandle hdrbuf_handle = xvbm_get_buffer_handle(cmd->obuf_ctx->hdr_pool_handle, 0);
+    int32_t outbuf_num = xvbm_buffer_pool_num_buffers_get(obuf_handle);
+    int32_t hdrbuf_num = xvbm_buffer_pool_num_buffers_get(hdrbuf_handle);
+    // reset all hdr buf indexes
+    for (i = 0; i < FRM_BUF_POOL_SIZE; i++) {
+        data->hdrbuf_info[i].freed_obuf_index = 0xBAD;
+    }
+    if(hdrbuf_num < outbuf_num) {
+        int32_t cnt = xvbm_buffer_pool_extend(hdrbuf_handle,
+                              (outbuf_num - hdrbuf_num));
+        if (cnt == outbuf_num) {
+            xma_logmsg(XMA_DEBUG_LOG, XMA_VCU_DECODER,
+                    "%s : extended earlier hdr output pool to %d buffers\n", __func__, outbuf_num);
+        } else {
+            xma_logmsg(XMA_ERROR_LOG, XMA_VCU_DECODER,
+                    "%s : failed to extend hdr memory pool. out of memory ?\n", __func__);
+            return XMA_ERROR;
+        }
+        for(i = 0; i < (outbuf_num - hdrbuf_num) && i < FRM_BUF_POOL_SIZE; i++) {
+          cmd->hdr_xvbm_buffer_handle = xvbm_buffer_pool_entry_alloc(cmd->obuf_ctx->hdr_pool_handle);
+          hdr_paddr = xvbm_buffer_get_paddr(cmd->hdr_xvbm_buffer_handle);
+          if (!hdr_paddr) {
+              xma_logmsg(XMA_ERROR_LOG, XMA_VCU_DECODER,"%s : Error - no free output hdr buffer available\n", __func__);
+              return XMA_ERROR;
+          }
+          data->hdrbuf_info[i].freed_obuf_index = xvbm_buffer_get_id(cmd->hdr_xvbm_buffer_handle);
+          data->hdrbuf_info[i].freed_obuf_paddr = hdr_paddr;
+          data->hdrbuf_info[i].freed_obuf_size = xvbm_buffer_get_size(cmd->hdr_xvbm_buffer_handle);
+        }
+    }
+#endif
 
     free_pool_size = xvbm_get_freelist_count(cmd->obuf_ctx->out_pool_handle);
 
     // reset all obuf indexes
-    for (i = 0; i < MAX_OUT_INFOS; i++) {
+    for (i = 0; i < FRM_BUF_POOL_SIZE; i++) {
         data->obuf_info[i].freed_obuf_index = 0xBAD;
     }
 
-    if (free_pool_size > MAX_OUT_INFOS) {
+    if (free_pool_size > FRM_BUF_POOL_SIZE) {
         xma_logmsg(XMA_WARNING_LOG, XMA_VCU_DECODER,
                    "free pool size is greater than max out infos array...restricting to max out infos\n");
-        free_pool_size = MAX_OUT_INFOS;
+        free_pool_size = FRM_BUF_POOL_SIZE;
     }
     data->valid_oidxs = free_pool_size;
 
@@ -311,13 +426,14 @@ fill_free_outbuffer_indexes (xrt_cmd_data_t *cmd,  sk_payload_data *data)
                        "Error: (%s) obuf_ctx Buffer Pool full - no free buffer available\n", __func__);
         }
     }
+    return XMA_SUCCESS;
 }
 
 static bool validate_params_data(dec_params_t *data)
 {
     /* limit checks in line with FFMpeg plugin */
 
-    if (data->bitdepth != 8) {
+    if ((data->bitdepth != 8) && (data->bitdepth != 10)) {
         xma_logmsg(XMA_ERROR_LOG, XMA_VCU_DECODER, "bitdepth %d is not supported\n",
                    data->bitdepth);
         return false;
@@ -356,8 +472,11 @@ static bool validate_params_data(dec_params_t *data)
     if (data->codec_type == 0) {
         /* H264 */
         if ((data->profile != AVC_PROFILE_IDC_BASELINE) &&
+                (data->profile != AVC_PROFILE_IDC_CONSTRAINED_BASELINE) &&
                 (data->profile != AVC_PROFILE_IDC_MAIN) &&
-                (data->profile != AVC_PROFILE_IDC_HIGH)) {
+                (data->profile != AVC_PROFILE_IDC_HIGH) &&
+                (data->profile != AVC_PROFILE_IDC_HIGH10) &&
+                (data->profile != AVC_PROFILE_IDC_HIGH10_INTRA)) {
             xma_logmsg(XMA_ERROR_LOG, XMA_VCU_DECODER, "profile %d is not supported\n",
                        data->profile);
             return false;
@@ -385,7 +504,8 @@ static bool validate_params_data(dec_params_t *data)
             case 50:
             case 51:
             case 52:
-            /* 6.2 is found to be supported, though spec says it isn't */
+            case 60:
+            case 61:
             case 62:
                 break;
             default:
@@ -395,7 +515,9 @@ static bool validate_params_data(dec_params_t *data)
         }
     } else {
         /* HEVC */
-        if (data->profile != HEVC_PROFILE_IDC_MAIN) {
+        if ((data->profile != HEVC_PROFILE_IDC_MAIN) &&
+            (data->profile != HEVC_PROFILE_IDC_MAIN10) &&
+            (data->profile != HEVC_PROFILE_IDC_RExt)) {
             xma_logmsg(XMA_ERROR_LOG, XMA_VCU_DECODER, "profile %d is not supported\n",
                        data->profile);
             return false;
@@ -418,7 +540,9 @@ static bool validate_params_data(dec_params_t *data)
             case 41:
             case 50:
             case 51:
-            /* 6.2 is found to be supported, though spec says it isn't */
+            case 52:
+            case 60:
+            case 61:
             case 62:
                 break;
             default:
@@ -566,7 +690,11 @@ static int prepare_sk_cmd(xrt_cmd_data_t *cmd, enum cmd_type type, int64_t pts)
             uint32_t i;
             uint32_t offset;
             uint64_t paddr;
+#ifdef HDR_DATA_SUPPORT
+            uint64_t hdr_paddr;
+#endif
             XvbmBufferHandle o_handle;
+            XvbmBufferHandle hdr_handle;
 
             cmd->obuf_ctx->dev_data = (sk_payload_data *) malloc(sizeof (sk_payload_data));
             if (!cmd->obuf_ctx->dev_data) {
@@ -612,7 +740,31 @@ static int prepare_sk_cmd(xrt_cmd_data_t *cmd, enum cmd_type type, int64_t pts)
                 ret = XMA_ERROR;
                 goto err4;
             }
+#ifdef HDR_DATA_SUPPORT
+            cmd->obuf_ctx->hdr_pool_handle = xvbm_buffer_pool_create(xma_plg_get_dev_handle(
+                                                 *(cmd->xma_session)), data.obuff_num, sizeof(vcu_hdr_data), 0);
+            if (cmd->obuf_ctx->hdr_pool_handle == nullptr) {
+                xma_logmsg(XMA_ERROR_LOG, XMA_VCU_DECODER, "Decoder HDR pool creation failed\n");
+                ret = XMA_ERROR;
+                goto err2;
+            }
 
+            cmd->obuf_ctx->hdr_parent_buff_obj = xma_plg_buffer_alloc(*(cmd->xma_session),
+                                             cmd->obuf_ctx->buf_count * sizeof (uint64_t), false, &ret);
+            if(ret != XMA_SUCCESS) {
+                xma_logmsg(XMA_ERROR_LOG, XMA_VCU_DECODER,
+                           "hdr_buff_handle failed for hdr buf\n");
+                ret = XMA_ERROR;
+                goto err3;
+            }
+            cmd->obuf_ctx->hdr_parent_buff_paddr = cmd->obuf_ctx->hdr_parent_buff_obj.paddr;
+            if (!cmd->obuf_ctx->hdr_parent_buff_paddr) {
+                xma_logmsg(XMA_ERROR_LOG, XMA_VCU_DECODER,
+                           "hdr_parent_buff_paddr for hdr buf failed\n");
+                ret = XMA_ERROR;
+                goto err4;
+            }
+#endif
             offset = 0;
             for (i = 0; i < data.obuff_num; i++) {
                 o_handle = xvbm_buffer_pool_entry_alloc(cmd->obuf_ctx->out_pool_handle);
@@ -628,12 +780,30 @@ static int prepare_sk_cmd(xrt_cmd_data_t *cmd, enum cmd_type type, int64_t pts)
                         goto err4;
                     }
 
-                    offset += sizeof (uint64_t);
                 } else {
                     xma_logmsg(XMA_ERROR_LOG, XMA_VCU_DECODER, "cant get output handle\n");
                     ret = XMA_ERROR;
                     goto err4;
                 }
+#ifdef HDR_DATA_SUPPORT
+                hdr_handle = xvbm_buffer_pool_entry_alloc(cmd->obuf_ctx->hdr_pool_handle);
+                if (hdr_handle) {
+                    hdr_paddr = xvbm_buffer_get_paddr(hdr_handle);
+
+                    memcpy ( cmd->obuf_ctx->hdr_parent_buff_obj.data+offset, &hdr_paddr, sizeof (uint64_t));
+                    ret = xma_plg_buffer_write (*(cmd->xma_session), cmd->obuf_ctx->hdr_parent_buff_obj,
+                                                sizeof (uint64_t), offset);
+                    if (ret != XMA_SUCCESS) {
+                        ret = XMA_ERROR;
+                        goto err4;
+                    }
+                } else {
+                    xma_logmsg(XMA_ERROR_LOG, XMA_VCU_DECODER, "cant get hdr handle\n");
+                    ret = XMA_ERROR;
+                    goto err4;
+                }
+#endif
+                offset += sizeof (uint64_t);
             }
             /* TODO: check below indxes*/
             cmd->registers[++idx] = cmd->obuf_ctx->parent_buff_paddr & 0xFFFFFFFF;
@@ -641,12 +811,23 @@ static int prepare_sk_cmd(xrt_cmd_data_t *cmd, enum cmd_type type, int64_t pts)
                                     0xFFFFFFFF;
             cmd->registers[++idx] = cmd->obuf_ctx->buf_count * sizeof (uint64_t);
 
-
+#ifdef HDR_DATA_SUPPORT
+            cmd->registers[++idx] = cmd->obuf_ctx->hdr_parent_buff_paddr & 0xFFFFFFFF;
+            cmd->registers[++idx] = ((uint64_t)(cmd->obuf_ctx->hdr_parent_buff_paddr) >> 32) &
+                                    0xFFFFFFFF;
+            cmd->registers[++idx] = cmd->obuf_ctx->buf_count * sizeof (uint64_t);
+#endif
             break;
 err4:
             xma_plg_buffer_free(*(cmd->xma_session), cmd->obuf_ctx->parent_buff_obj);
+#ifdef HDR_DATA_SUPPORT
+            xma_plg_buffer_free(*(cmd->xma_session), cmd->obuf_ctx->hdr_parent_buff_obj);
+#endif
 err3:
             xvbm_buffer_pool_destroy(cmd->obuf_ctx->out_pool_handle);
+#ifdef HDR_DATA_SUPPORT
+            xvbm_buffer_pool_destroy(cmd->obuf_ctx->hdr_pool_handle);
+#endif
 err2:
             if (cmd->obuf_ctx->pending_release) {
                 delete cmd->obuf_ctx->pending_release;
@@ -665,15 +846,13 @@ err1:
             break;
 
         case VCU_PUSH:
-            fill_free_outbuffer_indexes (cmd, &data);
-
             data.host_to_dev_ibuf_idx = cmd->host_to_dev_ibuf_idx;
             data.ibuff_valid_size = cmd->ibuff_valid_size;
             data.ibuff_meta.pts = pts;
-
+            ret = fill_free_outbuffer_indexes (cmd, &data);
             break;
         case VCU_RECEIVE:
-            fill_free_outbuffer_indexes (cmd, &data);
+            ret = fill_free_outbuffer_indexes (cmd, &data);
             break;
         case VCU_DEINIT:
             break;
@@ -855,6 +1034,14 @@ static int32_t xma_decoder_init(XmaDecoderSession *dec_session)
 
     sk_cmd->obuf_ctx->buf_size  = data.obuff_size;
     sk_cmd->obuf_ctx->buf_count = data.obuff_num;
+    // Ideally should be communicated by the Soft Kernel along with obuff_size
+    uint32_t tmp;
+    if (sk_cmd->params_data.bitdepth == 10)
+      tmp = ((props->width + 2) / 3) * 4;
+    else
+      tmp = props->width;
+    sk_cmd->obuf_ctx->stride = ALIGN(tmp, WIDTH_ALIGN);
+    sk_cmd->obuf_ctx->aligned_height = ALIGN(props->height, HEIGHT_ALIGN);
 
     sk_cmd->ibuf_ctx = (buff_pool_ctx_t *)malloc (sizeof (buff_pool_ctx_t));
     if (!(sk_cmd->ibuf_ctx)) {
@@ -923,6 +1110,12 @@ static int32_t xma_decoder_init(XmaDecoderSession *dec_session)
         ctx->latency_logging = 0;
     }
 
+    ctx->hdr_frame_count = 0;
+    ctx->disable_hdr10 = getenv("DISABLE_HDR10") ? 1 : 0;
+    ctx->last_push_status = XMA_SUCCESS;
+
+
+
     return XMA_SUCCESS;
 err7:
     for (int i = 0; i < MAX_IBUFFS; i++) {
@@ -956,6 +1149,7 @@ static int32_t xma_decoder_send(XmaDecoderSession *dec_session,
     XmaSession  xma_session  = dec_session->base;
     xrt_cmd_data_t *sk_cmd = ctx->sk_cmd;
     ctx->sk_cmd->xma_session = &xma_session;
+    *data_used = 0;
 #ifdef MEASURE_TIME
     struct timespec start, stop;
     struct timespec rstart, rstop;
@@ -1005,7 +1199,7 @@ static int32_t xma_decoder_send(XmaDecoderSession *dec_session,
         return XMA_ERROR;
     }
 
-    if (data->alloc_size) {
+    if (data->alloc_size && ctx->last_push_status == XMA_SUCCESS) {
         memcpy (sk_cmd->ibuf_ctx->buff_obj_arr[sk_cmd->host_to_dev_ibuf_idx].data,
                 data->data.buffer, data->alloc_size);
         ret = xma_plg_buffer_write (xma_session,
@@ -1035,10 +1229,6 @@ static int32_t xma_decoder_send(XmaDecoderSession *dec_session,
     ctx->send_xrt_time += ((rstop.tv_sec - rstart.tv_sec) * 1e6 +
                            (rstop.tv_nsec - rstart.tv_nsec) / 1e3);
 #endif
-    /* all the data will be copied on device side, so mark total size as used */
-    *data_used = data->alloc_size;
-
-    /* check for request for output buffer allocation */
     bzero(&payload_data, sizeof(sk_payload_data));
     ret = xma_plg_buffer_read(xma_session, sk_cmd->payload_buf_obj,
                               sizeof(sk_payload_data), 0);
@@ -1087,8 +1277,11 @@ static int32_t xma_decoder_send(XmaDecoderSession *dec_session,
             syslog(LOG_DEBUG, "%s : %p : xma_dec_frame_sent %lld : %lld\n", __func__, ctx,
                    ctx->frame_sent, ctx->time_taken);
         }
+        ctx->last_push_status = XMA_SUCCESS;
+        *data_used = data->alloc_size;
         return XMA_SUCCESS;
     } else {
+        ctx->last_push_status = XMA_TRY_AGAIN;
         return XMA_TRY_AGAIN;
     }
 }
@@ -1145,11 +1338,19 @@ static int32_t xma_decoder_recv(XmaDecoderSession *dec_session, XmaFrame *frame)
             if (sk_cmd->use_zero_copy) {
                 frame->data[0].buffer = (XvbmBufferHandle) xvbm_get_buffer_handle(
                                             sk_cmd->obuf_ctx->out_pool_handle, idx);
-                if (sk_cmd->obuf_ctx->pending_release->erase(frame->data[0].buffer) == 0) {
+                auto buf_elem = sk_cmd->obuf_ctx->pending_release->find(frame->data[0].buffer);
+                if (buf_elem != sk_cmd->obuf_ctx->pending_release->end()) {
+                    sk_cmd->obuf_ctx->pending_release->erase(buf_elem);
+                } else {
                     xma_logmsg(XMA_WARNING_LOG, XMA_VCU_DECODER,
                                "%s: b_handle(%p) already released?, something went wrong here\n",
                                __func__, frame->data[0].buffer);
                 }
+                // For XVBM buffers we set num of planes to 1
+                frame->frame_props.linesize[0] = sk_cmd->obuf_ctx->stride;
+                //@TODO remove this dirty hack
+                // This is required for the downstream componen to know the chroma offset
+                frame->frame_props.linesize[1] = sk_cmd->obuf_ctx->aligned_height;
             } else {
                 uint32_t size = sk_cmd->obuf_ctx->buf_size * 2 / 3;
                 uint8_t *hbuf;
@@ -1183,11 +1384,12 @@ static int32_t xma_decoder_recv(XmaDecoderSession *dec_session, XmaFrame *frame)
                                "%s: b_handle(%p) already released?, something went wrong here\n",
                                __func__, b_handle);
                 }
+                frame->frame_props.linesize[0] = sk_cmd->obuf_ctx->stride;
+                frame->frame_props.linesize[1] = sk_cmd->obuf_ctx->stride;
             }
             frame->pts =
                 sk_cmd->obuf_ctx->dev_data->obuff_meta[sk_cmd->obuf_ctx->current_free_obuf_index].pts;
             sk_cmd->obuf_ctx->dev_data->free_index_cnt--;
-            sk_cmd->obuf_ctx->current_free_obuf_index++;
 #ifdef MEASURE_TIME
             clock_gettime (CLOCK_REALTIME, &stop);
             ctx->recv_func_time += ((stop.tv_sec - start.tv_sec) * 1e6 +
@@ -1198,6 +1400,34 @@ static int32_t xma_decoder_recv(XmaDecoderSession *dec_session, XmaFrame *frame)
                 ctx->recv_func_time = ctx->recv_xrt_time = ctx->recv_count = 0;
             }
 #endif
+
+#ifdef HDR_DATA_SUPPORT
+            /* Clear past side data */
+            frame->side_data = NULL;
+            if(!ctx->disable_hdr10 && sk_cmd->obuf_ctx->dev_data->obuff_meta[sk_cmd->obuf_ctx->current_free_obuf_index].is_hdr_present)
+            {
+                vcu_hdr_data *hbuf = decoder_get_hdr_data(sk_cmd->obuf_ctx->hdr_pool_handle, idx);
+
+                if(hbuf != NULL)
+                {
+                    xma_logmsg(XMA_DEBUG_LOG, XMA_VCU_DECODER, "HDR data in decoder - %d  \n", ++ctx->hdr_frame_count);
+                    print_hdr_data(hbuf);
+                    if(decoder_add_hdr_side_data(frame, hbuf) != XMA_SUCCESS)
+                    {
+                        xma_logmsg(XMA_ERROR_LOG, XMA_VCU_DECODER, "Failed decoder side data allocation \n");
+                        return XMA_ERROR;
+                    }
+                }
+                else
+                {
+                    return XMA_ERROR;
+                }
+                sk_cmd->obuf_ctx->dev_data->obuff_meta[sk_cmd->obuf_ctx->current_free_obuf_index].is_hdr_present = 0;
+            }
+#endif
+
+            sk_cmd->obuf_ctx->current_free_obuf_index++;
+
             return XMA_SUCCESS;
         } else {
 #ifdef MEASURE_TIME
@@ -1272,6 +1502,11 @@ static int32_t xma_decoder_recv(XmaDecoderSession *dec_session, XmaFrame *frame)
                                "%s: b_handle(%p) already released?, something went wrong here\n",
                                __func__, frame->data[0].buffer);
                 }
+                // For XVBM buffers we set num of planes to 1
+                frame->frame_props.linesize[0] = sk_cmd->obuf_ctx->stride;
+                //@TODO remove this dirty hack
+                // This is required for the downstream component to know the chroma offset
+                frame->frame_props.linesize[1] = sk_cmd->obuf_ctx->aligned_height;
             } else {
                 uint32_t size = sk_cmd->obuf_ctx->buf_size * 2 / 3;
                 uint8_t *hbuf;
@@ -1306,12 +1541,13 @@ static int32_t xma_decoder_recv(XmaDecoderSession *dec_session, XmaFrame *frame)
                                "%s: b_handle(%p) already released?, something went wrong here\n",
                                __func__, b_handle);
                 }
+                frame->frame_props.linesize[0] = sk_cmd->obuf_ctx->stride;
+                frame->frame_props.linesize[1] = sk_cmd->obuf_ctx->stride;
             }
             frame->pts =
                 sk_cmd->obuf_ctx->dev_data->obuff_meta[sk_cmd->obuf_ctx->current_free_obuf_index].pts;
         }
         sk_cmd->obuf_ctx->dev_data->free_index_cnt--;
-        sk_cmd->obuf_ctx->current_free_obuf_index++;
 #ifdef MEASURE_TIME
         clock_gettime (CLOCK_REALTIME, &stop);
         ctx->recv_func_time += ((stop.tv_sec - start.tv_sec) * 1e6 +
@@ -1322,6 +1558,32 @@ static int32_t xma_decoder_recv(XmaDecoderSession *dec_session, XmaFrame *frame)
             ctx->recv_func_time = ctx->recv_xrt_time = ctx->recv_count = 0;
         }
 #endif
+
+#ifdef HDR_DATA_SUPPORT
+        /* Clear past side data */
+        frame->side_data = NULL;
+        if(!ctx->disable_hdr10 && sk_cmd->obuf_ctx->dev_data->obuff_meta[sk_cmd->obuf_ctx->current_free_obuf_index].is_hdr_present)
+        {
+            vcu_hdr_data *hbuf = decoder_get_hdr_data(sk_cmd->obuf_ctx->hdr_pool_handle, idx);
+
+            if(hbuf != NULL) {
+                xma_logmsg(XMA_DEBUG_LOG, XMA_VCU_DECODER, "HDR data in decoder - %d  \n", ++ctx->hdr_frame_count);
+                print_hdr_data(hbuf);
+
+                if(decoder_add_hdr_side_data(frame, hbuf) != XMA_SUCCESS) {
+                    xma_logmsg(XMA_ERROR_LOG, XMA_VCU_DECODER,
+                            "Failed decoder side data allocation \n");
+                    return XMA_ERROR;
+                }
+            }
+            else {
+                return XMA_ERROR;
+            }
+            sk_cmd->obuf_ctx->dev_data->obuff_meta[sk_cmd->obuf_ctx->current_free_obuf_index].is_hdr_present = 0;
+        }
+#endif
+        sk_cmd->obuf_ctx->current_free_obuf_index++;
+
         return XMA_SUCCESS;
     } else {
         if (sk_cmd->obuf_ctx->dev_data->end_decoding) {
@@ -1433,6 +1695,10 @@ cleanup:
         }
         xvbm_buffer_pool_destroy(sk_cmd->obuf_ctx->out_pool_handle);
         xma_plg_buffer_free(xma_session, sk_cmd->obuf_ctx->parent_buff_obj);
+#ifdef HDR_DATA_SUPPORT
+        xvbm_buffer_pool_destroy(sk_cmd->obuf_ctx->hdr_pool_handle);
+        xma_plg_buffer_free(xma_session, sk_cmd->obuf_ctx->hdr_parent_buff_obj);
+#endif
         free(sk_cmd->obuf_ctx);
     }
 
@@ -1465,7 +1731,6 @@ static int32_t xma_decoder_get_properties (XmaDecoderSession *dec_session,
     xrt_cmd_data_t *sk_cmd = ctx->sk_cmd;
 
     if (fprops) {
-        fprops->format = XMA_VCU_NV12_FMT_TYPE;
         fprops->width = props->width;
         fprops->height = props->height;
         fprops->bits_per_pixel = sk_cmd->params_data.bitdepth;
@@ -1486,3 +1751,4 @@ XmaDecoderPlugin decoder_plugin = {
     .close = xma_decoder_close,
     .xma_version    = xma_decoder_version
 };
+
