@@ -39,6 +39,8 @@
 #define HEIGHT_ALIGN            64
 #define ALIGN(size,align)       (((size) + (align) - 1) & ~((align) - 1))
 
+#define TIMEOUT_DEC_WORK_ITEM    5000
+
 /* FRM_BUF_POOL_SIZE value comes from vcu control software which is 50 as of 2019.2 release.
    This  value is used in corresponding decoder softkernel
 */
@@ -235,6 +237,7 @@ typedef struct MpsocDecContext
     long long int frame_recv;
     struct timespec latency;
     long long int time_taken;
+    long long int max_work_item_time;
     int latency_logging;
     uint8_t *last_buf_ptr;
     uint32_t hdr_frame_count;
@@ -319,7 +322,7 @@ static int32_t run_xrt_cmd(xrt_cmd_data_t *cmd)
                                             (char *)(cmd->registers), DEC_REGMAP_SIZE*sizeof(uint32_t), &ret);
     };
 
-    ret = xma_plg_is_work_item_done(*(cmd->xma_session), 5000);
+    ret = xma_plg_is_work_item_done(*(cmd->xma_session), TIMEOUT_DEC_WORK_ITEM);
     if (ret != XMA_SUCCESS) {
         xma_logmsg(XMA_ERROR_LOG, XMA_VCU_DECODER,
                    "*****ERROR:: Decoder stopped responding (%s)*****\n", __func__);
@@ -410,7 +413,7 @@ fill_free_outbuffer_indexes (xrt_cmd_data_t *cmd,  sk_payload_data *data)
             if (!paddr) {
                 xma_logmsg(XMA_ERROR_LOG, XMA_VCU_DECODER,
                            "%s : Error - no free output buffer available\n", __func__);
-                return;
+                return XMA_ERROR;
             }
 
             data->obuf_info[i].freed_obuf_index = xvbm_buffer_get_id(
@@ -1089,6 +1092,7 @@ static int32_t xma_decoder_init(XmaDecoderSession *dec_session)
 
     ctx->frame_sent = 0;
     ctx->frame_recv = 0;
+    ctx->max_work_item_time = 0;
     clock_gettime (CLOCK_REALTIME, &ctx->latency);
     ctx->time_taken = (ctx->latency.tv_sec * 1e3) + (ctx->latency.tv_nsec / 1e6);
     syslog (LOG_DEBUG, "%s : %p : xma_decoder init done  at %lld\n", __func__, ctx,
@@ -1150,6 +1154,17 @@ static int32_t xma_decoder_send(XmaDecoderSession *dec_session,
     xrt_cmd_data_t *sk_cmd = ctx->sk_cmd;
     ctx->sk_cmd->xma_session = &xma_session;
     *data_used = 0;
+    if(data->alloc_size < 0) {
+        data->alloc_size = 0;
+    }
+    if(data->alloc_size > (int)sk_cmd->ibuf_ctx->buff_obj_arr[sk_cmd->host_to_dev_ibuf_idx].size) {
+        xma_logmsg(XMA_ERROR_LOG, XMA_VCU_DECODER,
+                    "[%s][%d]xma_dec : Incoming packet larger than worst-case "
+                    "buffer size! This input is not supported!\n", __func__, __LINE__);
+        return XMA_ERROR;
+    }
+
+    struct timespec wstart;
 #ifdef MEASURE_TIME
     struct timespec start, stop;
     struct timespec rstart, rstop;
@@ -1216,8 +1231,9 @@ static int32_t xma_decoder_send(XmaDecoderSession *dec_session,
     clock_gettime (CLOCK_REALTIME, &rstart);
 #endif
 
-    clock_gettime (CLOCK_REALTIME, &ctx->latency);
-    ctx->time_taken = (ctx->latency.tv_sec * 1e3) + (ctx->latency.tv_nsec / 1e6);
+    if (ctx->latency_logging) {
+        clock_gettime (CLOCK_REALTIME, &wstart);
+    }
 
     ret = run_xrt_cmd(sk_cmd);
     if (ret != XMA_SUCCESS) {
@@ -1250,6 +1266,13 @@ static int32_t xma_decoder_send(XmaDecoderSession *dec_session,
         ctx->time_taken = (ctx->latency.tv_sec * 1e3) + (ctx->latency.tv_nsec / 1e6);
         syslog (LOG_DEBUG, "%s : %p : xma_send done  at %lld\n", __func__, ctx,
                 ctx->time_taken);
+        long long int work_item_time =  ((ctx->latency.tv_sec - wstart.tv_sec) * 1e6 +
+                                        (ctx->latency.tv_nsec - wstart.tv_nsec) / 1e3);
+        if(work_item_time > ctx->max_work_item_time) {
+            ctx->max_work_item_time = work_item_time;
+            syslog (LOG_DEBUG, "%s : %p : Send: Decoder max work item time : %lld\n",
+                    __func__, ctx, ctx->max_work_item_time);
+        }
     }
 
 #ifdef MEASURE_TIME
@@ -1293,6 +1316,8 @@ static int32_t xma_decoder_recv(XmaDecoderSession *dec_session, XmaFrame *frame)
     MpsocDecContext  *ctx  = (MpsocDecContext *) dec_session->base.plugin_data;
     XmaSession  xma_session  = dec_session->base;
     xrt_cmd_data_t *sk_cmd = ctx->sk_cmd;
+
+    struct timespec wstart, wstop;
 #ifdef MEASURE_TIME
     struct timespec start, stop;
     struct timespec rstart, rstop;
@@ -1451,6 +1476,10 @@ static int32_t xma_decoder_recv(XmaDecoderSession *dec_session, XmaFrame *frame)
         return ret;
     }
 
+    if (ctx->latency_logging) {
+        clock_gettime (CLOCK_REALTIME, &wstart);
+    }
+
 #ifdef MEASURE_TIME
     clock_gettime (CLOCK_REALTIME, &rstart);
 #endif
@@ -1466,6 +1495,17 @@ static int32_t xma_decoder_recv(XmaDecoderSession *dec_session, XmaFrame *frame)
     ctx->recv_xrt_time += ((rstop.tv_sec - rstart.tv_sec) * 1e6 +
                            (rstop.tv_nsec - rstart.tv_nsec) / 1e3);
 #endif
+
+    if (ctx->latency_logging) {
+        clock_gettime (CLOCK_REALTIME, &wstop);
+        long long int work_item_time =  ((wstop.tv_sec - wstart.tv_sec) * 1e6 +
+                                        (wstop.tv_nsec - wstart.tv_nsec) / 1e3);
+        if(work_item_time > ctx->max_work_item_time) {
+            ctx->max_work_item_time = work_item_time;
+            syslog (LOG_DEBUG, "%s : %p : Recv: Decoder max work item time : %lld\n",
+                    __func__, ctx, ctx->max_work_item_time);
+        }
+    }
 
     ret = xma_plg_buffer_read(xma_session, sk_cmd->payload_buf_obj,
                               sizeof(sk_payload_data), 0);
@@ -1650,7 +1690,7 @@ static int32_t xma_decoder_close(XmaDecoderSession *dec_session)
                                             (char *)(sk_cmd->registers), DEC_REGMAP_SIZE*sizeof(uint32_t), &ret);
     };
 
-    ret = xma_plg_is_work_item_done(*(sk_cmd->xma_session), 5000);
+    ret = xma_plg_is_work_item_done(*(sk_cmd->xma_session), TIMEOUT_DEC_WORK_ITEM);
     if (ret != XMA_SUCCESS) {
         xma_logmsg(XMA_ERROR_LOG, XMA_VCU_DECODER,
                    "*****ERROR:: Decoder stopped responding (%s)*****\n", __func__);

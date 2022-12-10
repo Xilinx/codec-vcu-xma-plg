@@ -18,21 +18,44 @@
 cmake_minimum_required(VERSION 2.8.11)
 include (CMakeDependentOption)
 set(XMPSOC_PROJ "xilinx-u30-xmpsoccodecs")
-set(XMPSOC_PROJ_VERSION "1.1.0")
+set(XMPSOC_PROJ_VERSION "1.2.0")
 
 find_program(UNAME_EXEC uname)
 find_program(LSB_RELEASE_EXEC lsb_release)
 
-# Grab Arch information like x86-64
-execute_process(COMMAND ${UNAME_EXEC} -p
-    OUTPUT_VARIABLE UNAME_ARCHTYPE
-    OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(COMMAND ${LSB_RELEASE_EXEC} -is
+    OUTPUT_VARIABLE LINUX_FLAVOR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+if (${LINUX_FLAVOR} MATCHES "^(Ubuntu|Debian)")
+        # amd64
+        execute_process(
+        COMMAND dpkg --print-architecture
+        OUTPUT_VARIABLE CPACK_ARCH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+elseif (${LINUX_FLAVOR} MATCHES "^(RedHat|CentOS|Amazon|Fedora|SUSE)")
+        # x86_64
+        execute_process(
+        COMMAND uname -m
+        OUTPUT_VARIABLE CPACK_ARCH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+else()
+        message( SEND_ERROR "Trying to build on incompatible system \"${LINUX_FLAVOR}\"." )
+endif()
+
 # Grab OS release short name
 execute_process(COMMAND ${LSB_RELEASE_EXEC} -rs
-	OUTPUT_VARIABLE LSB_RELEASE_REL_SHORT
-	OUTPUT_STRIP_TRAILING_WHITESPACE)
+        OUTPUT_VARIABLE LSB_RELEASE_REL_SHORT
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
 
-set(XMPSOC_PROJ_NAME "${XMPSOC_PROJ}_${XMPSOC_PROJ_VERSION}_${LSB_RELEASE_REL_SHORT}-${UNAME_ARCHTYPE}")
+if (${LINUX_FLAVOR} MATCHES "^Amazon")
+        set(LSB_RELEASE_REL_SHORT "amzn${LSB_RELEASE_REL_SHORT}")
+endif()
+
+set(XMPSOC_PROJ_NAME "${XMPSOC_PROJ}_${XMPSOC_PROJ_VERSION}_${LSB_RELEASE_REL_SHORT}-${CPACK_ARCH}")
 
 project(${XMPSOC_PROJ})
 set(ENV{PKG_CONFIG_PATH} "$ENV{PKG_CONFIG_PATH}:/usr/lib/pkgconfig")
@@ -44,6 +67,8 @@ pkg_check_modules(XMA REQUIRED libxma2api)
 pkg_check_modules(XVBM REQUIRED xvbm)
 
 set (CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${XVBM_LDFLAGS} ${XRT_LDFLAGS} --stats -Bsymbolic")
+set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+set(CPACK_FILE_LICENSE_PATH "/usr/share/doc/xilinx/u30")
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_FLAGS	"${CMAKE_CXX_FLAGS} -std=c++11 -Wall -Wextra -DDSA64 -fpermissive")
@@ -94,6 +119,8 @@ target_link_libraries(vcu-xma-enc-plg ${XVBM_LDFLAGS})
 # Set the location for library installation
 install(TARGETS vcu-xma-dec-plg DESTINATION ${CMAKE_INSTALL_PREFIX}/xma_plugins)
 install(TARGETS vcu-xma-enc-plg DESTINATION ${CMAKE_INSTALL_PREFIX}/xma_plugins)
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/include/xlnx_enc_dyn_params.h DESTINATION ${CMAKE_INSTALL_PREFIX}/xma_plugins/include)
+install(FILES ${CPACK_RESOURCE_FILE_LICENSE} CONFIGURATIONS Release RUNTIME DESTINATION ${CPACK_FILE_LICENSE_PATH}/${XMPSOC_PROJ})
 
 # Packaging section
 set(CPACK_PACKAGE_NAME "${XMPSOC_PROJ}")
@@ -106,6 +133,6 @@ set(CPACK_PACKAGE_DESCRIPTION "The Xilinx MPSoC based encoder and decoder plugin
 							   the accelerated FPGA video codec kernels used to perform H264/HEVC
 							   encoding and decoding respecitvely")
 set(CPACK_DEBIAN_PACKAGE_DEPENDS "xrt (>= 2.11), xilinx-xvbm (>= 1.0.2) ")
-set(CPACK_RPM_PACKAGE_DEPENDS "xrt (>= 2.11), xilinx-xvbm (>= 1.0.2) ")
-set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION "/opt" "/opt/xilinx" "/usr/lib" "/usr/lib/pkgconfig")
+set(CPACK_RPM_PACKAGE_REQUIRES "xrt >= 2.11, xilinx-xvbm >= 1.0.2")
+set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION "/opt" "/opt/xilinx" "/usr/lib" "/usr/lib/pkgconfig" "/usr/share/doc/xilinx" "/usr/share/doc/xilinx/u30")
 include(CPack)
